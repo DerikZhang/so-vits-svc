@@ -1,8 +1,10 @@
+import glob
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import traceback
 from itertools import chain
@@ -29,6 +31,8 @@ logging.getLogger('multipart').setLevel(logging.WARNING)
 model = None
 spk = None
 debug = False
+
+local_model_root = './trained'
 
 cuda = {}
 if torch.cuda.is_available():
@@ -75,14 +79,23 @@ def updata_mix_info(files):
             traceback.print_exc()
         raise gr.Error(e)
 
-def modelAnalysis(model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix):
+def modelAnalysis(model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix,local_model_enabled,local_model_selection):
     global model
     try:
         device = cuda[device] if "CUDA" in device else device
         cluster_filepath = os.path.split(cluster_model_path.name) if cluster_model_path is not None else "no_cluster"
+        # get model and config path
+        if (local_model_enabled):
+            # local path
+            model_path = glob.glob(os.path.join(local_model_selection, '*.pth'))[0]
+            config_path = glob.glob(os.path.join(local_model_selection, '*.json'))[0]
+        else:
+            # upload from webpage
+            model_path = model_path.name
+            config_path = config_path.name
         fr = ".pkl" in cluster_filepath[1]
-        model = Svc(model_path.name,
-                config_path.name,
+        model = Svc(model_path,
+                config_path,
                 device=device if device != "Auto" else None,
                 cluster_model_path = cluster_model_path.name if cluster_model_path is not None else "",
                 nsf_hifigan_enhance=enhance,
@@ -212,9 +225,9 @@ def vc_fn2(_text, _lang, _gender, _rate, _volume, sid, output_format, vc_transfo
         _volume = f"+{int(_volume*100)}%" if _volume >= 0 else f"{int(_volume*100)}%"
         if _lang == "Auto":
             _gender = "Male" if _gender == "男" else "Female"
-            subprocess.run([r"python", "edgetts/tts.py", _text, _lang, _rate, _volume, _gender])
+            subprocess.run([sys.executable, "edgetts/tts.py", _text, _lang, _rate, _volume, _gender])
         else:
-            subprocess.run([r"python", "edgetts/tts.py", _text, _lang, _rate, _volume])
+            subprocess.run([sys.executable, "edgetts/tts.py", _text, _lang, _rate, _volume])
         target_sr = 44100
         y, sr = librosa.load("tts.wav")
         resampled_y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
@@ -239,6 +252,22 @@ def model_compression(_model):
         removeOptimizer(_model.name, output_path)
         return f"模型已成功被保存在了{output_path}"
 
+def scan_local_models():
+    res = []
+    candidates = glob.glob(os.path.join(local_model_root, '**', '*.json'), recursive=True)
+    candidates = set([os.path.dirname(c) for c in candidates])
+    for candidate in candidates:
+        jsons = glob.glob(os.path.join(candidate, '*.json'))
+        pths = glob.glob(os.path.join(candidate, '*.pth'))
+        if (len(jsons) == 1 and len(pths) == 1):
+            # must contain exactly one json and one pth file
+            res.append(candidate)
+    return res
+
+def local_model_refresh_fn():
+    choices = scan_local_models()
+    return gr.Dropdown.update(choices=choices)
+
 def debug_change():
     global debug
     debug = debug_button.value
@@ -260,9 +289,17 @@ with gr.Blocks(
                     gr.Markdown(value="""
                         <font size=2> 模型设置</font>
                         """)
-                    with gr.Row():
-                        model_path = gr.File(label="选择模型文件")
-                        config_path = gr.File(label="选择配置文件")
+                    with gr.Tabs():
+                        # invisible checkbox that tracks tab status
+                        local_model_enabled = gr.Checkbox(value=False, visible=False)
+                        with gr.TabItem('上传') as local_model_tab_upload:
+                            with gr.Row():
+                                model_path = gr.File(label="选择模型文件")
+                                config_path = gr.File(label="选择配置文件")
+                        with gr.TabItem('本地') as local_model_tab_local:
+                            gr.Markdown(f'模型应当放置于{local_model_root}文件夹下')
+                            local_model_refresh_btn = gr.Button('刷新本地模型列表')
+                            local_model_selection = gr.Dropdown(label='选择模型文件夹', choices=[], interactive=True)
                     with gr.Row():
                         diff_model_path = gr.File(label="选择扩散模型文件")
                         diff_config_path = gr.File(label="选择扩散模型配置文件")
@@ -286,7 +323,7 @@ with gr.Blocks(
                         <font size=2> 推理设置</font>
                         """)
                     auto_f0 = gr.Checkbox(label="自动f0预测，配合聚类模型f0预测效果更好,会导致变调功能失效（仅限转换语音，歌声勾选此项会究极跑调）", value=False)
-                    f0_predictor = gr.Dropdown(label="选择F0预测器,可选择crepe,pm,dio,harvest,默认为pm(注意：crepe为原F0使用均值滤波器)", choices=["pm","dio","harvest","crepe"], value="pm")
+                    f0_predictor = gr.Dropdown(label="选择F0预测器,可选择crepe,pm,dio,harvest,rmvpe,默认为pm(注意：crepe为原F0使用均值滤波器)", choices=["pm","dio","harvest","crepe","rmvpe"], value="pm")
                     vc_transform = gr.Number(label="变调（整数，可以正负，半音数量，升高八度就是12）", value=0)
                     cluster_ratio = gr.Number(label="聚类模型/特征检索混合比例，0-1之间，0即不启用聚类/特征检索。使用聚类/特征检索能提升音色相似度，但会导致咬字下降（如果使用建议0.5左右）", value=0)
                     slice_db = gr.Number(label="切片阈值", value=-40)
@@ -374,11 +411,17 @@ with gr.Blocks(
                     <font size=2> WebUI设置</font>
                     """)
                 debug_button = gr.Checkbox(label="Debug模式，如果向社区反馈BUG需要打开，打开后控制台可以显示具体错误提示", value=debug)
+        # refresh local model list
+        local_model_refresh_btn.click(local_model_refresh_fn, outputs=local_model_selection)
+        # set local enabled/disabled on tab switch
+        local_model_tab_upload.select(lambda: False, outputs=local_model_enabled)
+        local_model_tab_local.select(lambda: True, outputs=local_model_enabled)
+        
         vc_submit.click(vc_fn, [sid, vc_input3, output_format, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold,k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment], [vc_output1, vc_output2])
         vc_submit2.click(vc_fn2, [text2tts, tts_lang, tts_gender, tts_rate, tts_volume, sid, output_format, vc_transform,auto_f0,cluster_ratio, slice_db, noise_scale,pad_seconds,cl_num,lg_num,lgr_num,f0_predictor,enhancer_adaptive_key,cr_threshold,k_step,use_spk_mix,second_encoding,loudness_envelope_adjustment], [vc_output1, vc_output2])
 
         debug_button.change(debug_change,[],[])
-        model_load_button.click(modelAnalysis,[model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix],[sid,sid_output])
+        model_load_button.click(modelAnalysis,[model_path,config_path,cluster_model_path,device,enhance,diff_model_path,diff_config_path,only_diffusion,use_spk_mix,local_model_enabled,local_model_selection],[sid,sid_output])
         model_unload_button.click(modelUnload,[],[sid,sid_output])
     os.system("start http://127.0.0.1:7860")
     app.launch()
